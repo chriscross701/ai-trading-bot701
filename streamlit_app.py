@@ -4,8 +4,8 @@ import requests
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Trading Bot 5.0 | Paper Scanner", layout="wide")
-st.title("Trading Bot 5.0 – Top-100 Paper Scanner")
+st.set_page_config(page_title="Trading Bot 5.1 | Paper Scanner", layout="wide")
+st.title("Trading Bot 5.1 – Top-100 Paper Scanner")
 st.caption("Nur Simulation. Keine echten Orders, keine KI-API. USD-Konto. Keine Renditegarantie.")
 START = 100.0
 CG = "https://api.coingecko.com/api/v3/coins/markets"
@@ -15,7 +15,7 @@ S.headers.update({"User-Agent": "PaperScanner/5.0 (educational)"})
 
 if "bot5" not in st.session_state:
     st.session_state.bot5 = dict(cash=START, positions={}, trades=[], checks=0, peak=START,
-                                 last_candle={}, started=time.time(), stopped=False, errors=[])
+                                 last_candle={}, started=time.time(), stopped=False, errors=[], scan_cursor=0, snapshots={}, cooldown={})
 b = st.session_state.bot5
 
 with st.sidebar:
@@ -27,7 +27,10 @@ with st.sidebar:
     fee_pct = st.number_input("Gebühr je Seite (%)", 0.0, 1.0, 0.10, 0.01)
     slip_pct = st.number_input("Slippage je Seite (%)", 0.0, 1.0, 0.05, 0.01)
     max_dd = st.slider("Maximaler Drawdown (%)", 5, 40, 15)
-    scan_n = st.slider("Kandidaten für Kerzenanalyse", 3, 12, 6)
+    scan_n = st.slider("Coins im Scan-Pool", 20, 60, 50, 5)
+    batch_n = st.slider("Coins je Scan-Runde", 3, 10, 5)
+    max_minutes = st.slider("Maximale Haltedauer (Minuten)", 5, 120, 30, 5)
+    cooldown_minutes = st.slider("Pause nach Schließung (Minuten)", 1, 30, 5)
     if st.button("Simulation zurücksetzen"):
         del st.session_state.bot5
         st.rerun()
@@ -85,7 +88,13 @@ def signal(df):
     long = f.iloc[-1]>s.iloc[-1] and f.iloc[-1]>f.iloc[-2] and 53<rsi<72 and vr>1.05
     short = f.iloc[-1]<s.iloc[-1] and f.iloc[-1]<f.iloc[-2] and 28<rsi<47 and vr>1.05
     side = "LONG" if long else "SHORT" if short else "HOLD"
-    score = min(100., max(0., (vr-1)*30 + abs(f.iloc[-1]/s.iloc[-1]-1)*10000)) if side != "HOLD" else 0.
+    # Score is a heuristic, not a probability or profit prediction.
+    trend = abs(float(f.iloc[-1] / s.iloc[-1] - 1)) * 10000
+    vol_score = max(0., (vr - 0.8) * 22)
+    momentum = abs(rsi - 50) * 0.9
+    score = min(100., trend * 1.4 + vol_score + momentum)
+    if side == "HOLD":
+        score = min(score, 49.9)
     return side, rsi, atr, int(d["time"].iloc[-1]), score
 
 def fill(price, side, entering):
@@ -107,11 +116,14 @@ def close_position(coin, px, reason):
     exit_fee = p["notional"]*fee_pct/100
     net = p["notional"]*move-p["entry_fee"]-exit_fee
     b["cash"] += p["margin"]+p["notional"]*move-exit_fee
+    b["cooldown"][coin] = time.time()
     b["trades"].insert(0,dict(time=datetime.now(timezone.utc).isoformat(timespec="seconds"),coin=coin,
                               side=p["side"],action="CLOSE",pnl=round(net,4),reason=reason))
 
 def open_position(coin, side, px, atr, eq):
     if coin in b["positions"] or len(b["positions"])>=max_positions:
+        return False
+    if time.time() - b["cooldown"].get(coin, 0) < cooldown_minutes * 60:
         return False
     stop = max(0.004,min(0.025,1.5*atr/px))
     notional = min(eq*risk_pct/100/stop, eq*leverage/max_positions, b["cash"]*leverage*0.75)
@@ -137,39 +149,73 @@ def live():
     except Exception as e:
         st.error(f"Marktübersicht nicht verfügbar: {e}. Keine neuen Orders.")
         return
-    # CoinGecko ranks by market cap; exclude stablecoins and wrapped tokens.
-    banned={"USDT","USDC","DAI","FDUSD","USDE","TUSD","WBTC","WETH","STETH","WEETH","WSTETH"}
-    shortlist=[]
+    # Top-100 by market cap, but filter unsuitable/pegged assets.
+    banned = {"USDT","USDC","DAI","FDUSD","USDE","TUSD","WBTC","WETH",
+              "STETH","WEETH","WSTETH","USD1","PYUSD","USDD","USDS",
+              "USDP","RLUSD","EURC","EURCV","FRAX","SUSDE","BUIDL"}
+    shortlist = []
     for c in coins:
-        sym=c["symbol"].upper()
-        lookup="XBT" if sym=="BTC" else sym
-        if sym in banned or lookup not in pairs or not c.get("total_volume") or c["total_volume"]<5_000_000:
+        sym = str(c.get("symbol", "")).upper()
+        name = str(c.get("name", "")).lower()
+        lookup = "XBT" if sym == "BTC" else sym
+        if (sym in banned or lookup not in pairs or
+            any(word in name for word in ("stablecoin", "wrapped", "bridged", "tokenized")) or
+            float(c.get("total_volume") or 0) < 5_000_000):
             continue
-        # More active USD markets first; ranking is a shortlist, not proof of edge.
-        shortlist.append((sym,pairs[lookup],c))
-    shortlist.sort(key=lambda x: float(x[2].get("total_volume") or 0),reverse=True)
-    selected=shortlist[:scan_n]
-    # Always watch open positions, even if they fall out of the shortlist.
-    watch={sym:pair for sym,pair,_ in selected}
+        # Ignore likely USD-pegged assets; this also excludes some legitimate $1 coins.
+        if ("usd" in name and "bitcoin" not in name) or "dollar" in name:
+            continue
+        shortlist.append((sym, pairs[lookup], c))
+    shortlist.sort(key=lambda x: float(x[2].get("total_volume") or 0), reverse=True)
+    selected = shortlist[:scan_n]
+    pool = {sym: pair for sym, pair, _ in selected}
+    # Keep open positions watched even if they drop out of the current pool.
     for coin in b["positions"]:
-        if coin not in watch:
-            for sym,pair,_ in shortlist:
-                if sym==coin:
-                    watch[coin]=pair
-                    break
-    prices={}; candidates=[]; rows=[]
-    for sym,pair in watch.items():
+        if coin not in pool:
+            pair = next((pair for sym, pair, _ in shortlist if sym == coin), None)
+            if pair:
+                pool[coin] = pair
+
+    # Scan only a batch per refresh. This avoids bursts of 50 HTTP requests
+    # and gradually covers the whole pool (~20s for 50 coins at 5 per 2s).
+    selected_keys = [sym for sym, _, _ in selected]
+    cursor = b["scan_cursor"] % max(1, len(selected_keys))
+    batch = [selected_keys[(cursor + i) % len(selected_keys)]
+             for i in range(min(batch_n, len(selected_keys)))]
+    b["scan_cursor"] = (cursor + len(batch)) % max(1, len(selected_keys))
+    watch = dict((sym, pool[sym]) for sym in batch)
+    for coin in b["positions"]:
+        if coin in pool:
+            watch[coin] = pool[coin]
+
+    prices, errors = {}, []
+    now = time.time()
+    for sym, pair in watch.items():
         try:
-            df=ohlc(pair)
-            px=float(df["close"].iloc[-1])
-            side,rsi,atr,candle,score=signal(df)
-            prices[sym]=px
-            rows.append(dict(coin=sym,price=round(px,5),RSI=round(rsi,1),signal=side,score=round(score,1)))
-            candidates.append((score,sym,side,px,atr,candle))
+            df = ohlc(pair)
+            px = float(df["close"].iloc[-1])
+            side, rsi, atr, candle, score = signal(df)
+            prices[sym] = px
+            b["snapshots"][sym] = dict(coin=sym, price=px, RSI=round(rsi, 1),
+                signal=side, score=round(score, 1), atr=atr, candle=candle,
+                updated=now)
         except Exception as e:
             errors.append(f"{sym}: {str(e)[:90]}")
+
+    # Discard stale signals; stale entries must never trigger trades.
+    b["snapshots"] = {sym: item for sym, item in b["snapshots"].items()
+                      if sym in pool and now - item["updated"] < 180}
+    fresh = [item for item in b["snapshots"].values()
+             if now - item["updated"] < 75]
+    rows = [dict(coin=x["coin"], price=round(x["price"], 5),
+                 RSI=x["RSI"], signal=x["signal"], score=x["score"],
+                 age_s=int(now-x["updated"])) for x in fresh]
+    candidates = [(x["score"], x["coin"], x["signal"], x["price"],
+                   x["atr"], x["candle"]) for x in fresh]
     if errors:
-        st.warning("Einige Kurse fehlen. Keine neuen Einstiege bei Datenfehlern: "+" | ".join(errors[:4]))
+        st.warning("Marktdatenfehler: " + " | ".join(errors[:4]))
+    if len(fresh) < len(selected):
+        st.info(f"Scanner füllt sich: {len(fresh)} von {len(selected)} Coins aktuell bewertet.")
     eq=equity(prices)
     b["peak"]=max(b["peak"],eq)
     if eq <= b["peak"]*(1-max_dd/100):
@@ -191,9 +237,12 @@ def live():
                 close_position(coin,px,"Trailing-Stop")
             elif opposite and opposite[2] not in ("HOLD",p["side"]):
                 close_position(coin,px,"Gegensignal")
-        if not b["stopped"] and not errors:
+            elif time.time()-p["opened"] >= max_minutes*60:
+                close_position(coin,px,"Zeitlimit")
+        if not b["stopped"]:
+            # Only open on a coin scanned THIS round; old rankings are for display.
             for score,coin,side,px,atr,candle in sorted(candidates,reverse=True):
-                if side=="HOLD" or candle is None or b["last_candle"].get(coin)==candle:
+                if coin not in watch or coin not in prices or side=="HOLD" or candle is None or b["last_candle"].get(coin)==candle:
                     continue
                 if open_position(coin,side,px,atr,equity(prices)):
                     b["last_candle"][coin]=candle
@@ -205,17 +254,25 @@ def live():
     c1.metric("Equity (USD)",f"{eq:.2f}",f"{eq-START:+.2f}")
     c2.metric("Ziel 1.000 USD",f"{eq/10:.1f}%")
     c3.metric("Geschlossene Trades",str(len(closed)))
-    st.write(f"Automatik: {'AN' if enabled else 'AUS'} · Prüfungen: {b['checks']} · Kandidaten: {len(watch)} · Letzte Prüfung: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
+    st.write(f"Automatik: {'AN' if enabled else 'AUS'} · Prüfungen: {b['checks']} · Aktuell bewertet: {len(fresh)}/{len(selected)} · Letzte Prüfung: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}")
     if b["stopped"]:
         st.error("Drawdown-Limit erreicht: keine neuen Positionen. Bestehende Positionen weiter überwachen.")
     st.subheader("Signal-Ranking (Kraken-USD-Märkte)")
-    st.table(pd.DataFrame(rows).sort_values("score",ascending=False) if rows else pd.DataFrame())
+    if rows:
+        ranking = pd.DataFrame(rows).sort_values(["signal", "score"], ascending=[True, False])
+        active = ranking[ranking["signal"] != "HOLD"].sort_values("score", ascending=False)
+        st.write(f"Handelssignale: {len(active)} · Scan-Pool: {len(selected)} Coins")
+        st.table(active.head(10) if not active.empty else ranking.sort_values("score", ascending=False).head(10))
+        with st.expander("Alle aktuell bewerteten Coins"):
+            st.table(ranking.sort_values("score", ascending=False))
+    else:
+        st.info("Warte auf erste Marktdaten.")
     st.subheader("Offene Positionen")
     st.write(b["positions"] if b["positions"] else "Keine")
     st.subheader("Handelsprotokoll")
     st.table(pd.DataFrame(b["trades"][:100]) if b["trades"] else pd.DataFrame())
     if closed:
         st.write(f"Netto-PnL geschlossene Trades: {sum(closed):+.2f} USD · Trefferquote: {sum(x>0 for x in closed)/len(closed)*100:.1f}%")
-    st.caption("Top-100-Liste alle 120 s, OHLC alle 60 s; Oberfläche ca. alle 2 s. Kein Tickfeed. Nur ein Teil der Top 100 wird mit Kerzendaten analysiert. Keine Funding-, Liquidations- oder vollständige Spread-Modellierung. Daten nur in Sitzung.")
+    st.caption("Top-100-Liste alle 120 s; OHLC je Coin bis zu 60 s gecacht; Scanner prüft Coins in Teilgruppen. Keine echte Echtzeit- oder 24/7-Garantie. Nur liquide Kraken-USD-Märkte aus den Top 100 werden analysiert. Keine Funding-, Liquidations- oder vollständige Spread-Modellierung. Daten nur in Sitzung.")
 
 live()
