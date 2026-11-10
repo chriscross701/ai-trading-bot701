@@ -171,3 +171,4 @@ def live():
     st.caption('Daten von Kraken OHLC (1-Minute), kein Tickfeed. Aktualisierung ~2 Sekunden, nicht garantiert. Keine Funding-, Liquidations- oder vollständige Spread-Modellierung. Sitzungsdaten können verloren gehen. Keine echte KI oder Renditegarantie.')
 
 live()
+
