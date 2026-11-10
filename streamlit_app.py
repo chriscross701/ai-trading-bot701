@@ -161,11 +161,11 @@ def live():
         st.error('Drawdown-Grenze erreicht. Neue Einstiege gesperrt; bestehende Positionen werden bei eingeschalteter Automatik weiter überwacht.')
     if elapsed >= 7:
         st.info('Die sieben Tage sind abgelaufen. Die Simulation läuft weiter, solange sie geöffnet ist.')
-    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    st.table(pd.DataFrame(rows), hide_index=True, use_container_width=True)
     st.subheader('Offene Positionen')
-    st.dataframe(pd.DataFrame([dict(coin=c, **p) for c,p in b['positions'].items()]), hide_index=True, use_container_width=True)
+    st.table(pd.DataFrame([dict(coin=c, **p) for c,p in b['positions'].items()]), hide_index=True, use_container_width=True)
     st.subheader('Handelsprotokoll')
-    st.dataframe(pd.DataFrame(b['trades']), hide_index=True, use_container_width=True)
+    st.table(pd.DataFrame(b['trades']), hide_index=True, use_container_width=True)
     closed = [t['pnl'] for t in b['trades'] if t['action']=='CLOSE']
     st.write(f'Geschlossene Trades: {len(closed)} · Trefferquote: {100*sum(x>0 for x in closed)/len(closed):.1f}%' if closed else 'Noch keine geschlossenen Trades')
     st.caption('Daten von Kraken OHLC (1-Minute), kein Tickfeed. Aktualisierung ~2 Sekunden, nicht garantiert. Keine Funding-, Liquidations- oder vollständige Spread-Modellierung. Sitzungsdaten können verloren gehen. Keine echte KI oder Renditegarantie.')
