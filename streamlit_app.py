@@ -165,7 +165,7 @@ def live():
     st.subheader('Offene Positionen')
     st.table(pd.DataFrame([dict(coin=c, **p) for c,p in b['positions'].items()]), hide_index=True, use_container_width=True)
     st.subheader('Handelsprotokoll')
-    st.table(pd.DataFrame(b['trades'])
+    st.table(pd.DataFrame(b['trades']))
     closed = [t['pnl'] for t in b['trades'] if t['action']=='CLOSE']
     st.write(f'Geschlossene Trades: {len(closed)} · Trefferquote: {100*sum(x>0 for x in closed)/len(closed):.1f}%' if closed else 'Noch keine geschlossenen Trades')
     st.caption('Daten von Kraken OHLC (1-Minute), kein Tickfeed. Aktualisierung ~2 Sekunden, nicht garantiert. Keine Funding-, Liquidations- oder vollständige Spread-Modellierung. Sitzungsdaten können verloren gehen. Keine echte KI oder Renditegarantie.')
