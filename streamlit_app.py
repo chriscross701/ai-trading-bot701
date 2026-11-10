@@ -163,7 +163,7 @@ def live():
         st.info('Die sieben Tage sind abgelaufen. Die Simulation läuft weiter, solange sie geöffnet ist.')
     st.table(pd.DataFrame(rows))
     st.subheader('Offene Positionen')
-    st.table(pd.DataFrame([dict(coin=c, **p) for c,p in b['positions'].items()]), hide_index=True, use_container_width=True)
+    st.write(b['positions'])
     st.subheader('Handelsprotokoll')
     st.table(pd.DataFrame(b['trades']))
     closed = [t['pnl'] for t in b['trades'] if t['action']=='CLOSE']
