@@ -1,142 +1,158 @@
-import json
-import urllib.request
+import time
 from datetime import datetime, timezone
-
+import requests
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="AI Trading Bot 3.0", page_icon="📈", layout="wide")
-st.title("AI Trading Bot 3.0 – Paper Scalping")
-st.caption("Nur Simulation: Long / Short, 1–5x Hebel. Keine echten Orders und keine KI-API.")
+st.set_page_config(page_title='AI Trading Bot 3.1', layout='wide')
+st.title('AI Trading Bot 3.1 – Paper Scalping')
+st.caption('Simulation only. No exchange orders, no API keys. Refresh target: 1 second while session is active.')
 
-PAIRS = {"BTC": "XXBTZEUR", "SOL": "SOLEUR", "ETH": "XETHZEUR"}
-FEE_RATE = 0.0008  # Annahme: 0,08 %? Nein: 0,08 % pro Seite; anpassen an Broker
-# Für konservative Simulation 0,8 % pro Seite (Taker-Basisannahme)
-FEE_RATE = 0.008
-START = 100.0
+if 'cash' not in st.session_state:
+    st.session_state.cash = 100.0
+    st.session_state.position = None
+    st.session_state.trades = []
+    st.session_state.checks = 0
+    st.session_state.last_check = None
+    st.session_state.test_started = False
+    st.session_state.test_completed = False
+    st.session_state.last_signal_candle = {}
+    st.session_state.day_start = 100.0
 
-def fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "PaperTradingDemo/1.0"})
-    with urllib.request.urlopen(req, timeout=8) as r:
-        data = json.load(r)
-    if data.get("error"):
-        raise RuntimeError(str(data["error"]))
-    return data["result"]
+with st.sidebar:
+    st.header('Einstellungen')
+    enabled = st.toggle('Automatische Paper-Trades', value=False)
+    leverage = st.slider('Hebel (Simulation)', 1, 5, 2)
+    margin = st.slider('Margin pro Position (€)', 1.0, 10.0, 5.0)
+    stop_pct = st.slider('Stop-Loss: Kursbewegung (%)', 0.2, 3.0, 1.0, 0.1)
+    take_pct = st.slider('Take-Profit: Kursbewegung (%)', 0.2, 5.0, 2.0, 0.1)
+    fee_pct = st.number_input('Gebühr pro Orderseite (%)', 0.0, 2.0, 0.1, 0.01)
+    test_mode = st.toggle('Einmaligen Testtrade ausführen', value=False, help='Öffnet eine kleine virtuelle BTC-Long-Position und schließt sie nach 30 Sekunden. Nur bei eingeschalteter Automatik.')
+    if st.button('Simulation zurücksetzen'):
+        for k in ('cash','position','trades','checks','last_check','test_started','test_completed','last_signal_candle','day_start'):
+            st.session_state.pop(k, None)
+        st.rerun()
 
-def get_market(coin):
-    pair = PAIRS[coin]
-    data = fetch_json(f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval=1")
-    key = next(k for k in data if k != "last")
-    rows = data[key]
-    # Kraken liefert die letzte, noch laufende Kerze: nicht für Signale verwenden.
-    closed = rows[:-1]
-    if len(closed) < 30:
-        raise RuntimeError("Zu wenige abgeschlossene Kerzen")
-    df = pd.DataFrame(closed, columns=["time", "open", "high", "low", "close", "vwap", "volume", "count"])
-    for c in ("close", "volume"):
-        df[c] = pd.to_numeric(df[c])
-    close = df["close"]
-    df["ema9"] = close.ewm(span=9, adjust=False).mean()
-    df["ema21"] = close.ewm(span=21, adjust=False).mean()
+@st.cache_data(ttl=1, show_spinner=False)
+def ticker(symbol):
+    response = requests.get('https://api.binance.com/api/v3/ticker/price', params={'symbol':symbol}, timeout=5)
+    response.raise_for_status()
+    return float(response.json()['price'])
+
+@st.cache_data(ttl=15, show_spinner=False)
+def candles(symbol):
+    response = requests.get('https://api.binance.com/api/v3/klines', params={'symbol':symbol,'interval':'1m','limit':80}, timeout=5)
+    response.raise_for_status()
+    rows = response.json()
+    df = pd.DataFrame(rows)
+    df['close'] = pd.to_numeric(df[4]); df['volume'] = pd.to_numeric(df[5])
+    return df
+
+def signal(df):
+    # Only completed candles: never act on the still-forming candle.
+    d = df.iloc[:-1].copy()
+    close = d['close']; vol = d['volume']
+    fast = close.ewm(span=9, adjust=False).mean()
+    slow = close.ewm(span=21, adjust=False).mean()
     delta = close.diff()
     up = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     down = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = up / down.replace(0, float("nan"))
-    df["rsi"] = 100 - (100 / (1 + rs))
-    last, prev = df.iloc[-1], df.iloc[-2]
-    vol_avg = df["volume"].iloc[-21:-1].mean()
-    volume_ok = last["volume"] > vol_avg * 1.1
-    long_signal = prev["ema9"] <= prev["ema21"] and last["ema9"] > last["ema21"] and 50 < last["rsi"] < 75 and volume_ok
-    short_signal = prev["ema9"] >= prev["ema21"] and last["ema9"] < last["ema21"] and 25 < last["rsi"] < 50 and volume_ok
-    signal = "LONG" if long_signal else "SHORT" if short_signal else "HOLD"
-    return {"coin": coin, "price": float(last["close"]), "rsi": float(last["rsi"]), "signal": signal, "candle": int(last["time"]), "volume_ok": bool(volume_ok)}
+    rsi = 100 - 100/(1 + up/(down + 1e-12))
+    volume_ok = bool(vol.iloc[-1] > vol.iloc[-21:-1].mean())
+    direction = 'HOLD'
+    if volume_ok and fast.iloc[-1] > slow.iloc[-1] and 52 < rsi.iloc[-1] < 72:
+        direction = 'LONG'
+    elif volume_ok and fast.iloc[-1] < slow.iloc[-1] and 28 < rsi.iloc[-1] < 48:
+        direction = 'SHORT'
+    return direction, round(float(rsi.iloc[-1]),1), volume_ok, int(d.iloc[-1,0])
 
-for k, v in {"cash": START, "position": None, "trades": [], "last_signal": None, "enabled": False, "day": datetime.now(timezone.utc).date().isoformat(), "day_start": START, "halted": False}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
+def equity(prices):
+    p = st.session_state.position
+    if not p:
+        return st.session_state.cash
+    current = prices.get(p['coin'],p['entry'])
+    change = (current/p['entry']-1) * (1 if p['side']=='LONG' else -1)
+    return st.session_state.cash + p['margin'] + p['notional']*change
 
-with st.sidebar:
-    st.header("Einstellungen")
-    st.toggle("Automatische Paper-Trades", key="enabled")
-    leverage = st.slider("Hebel (Simulation)", 1, 5, 2)
-    margin = st.slider("Margin pro Position (€)", 2, 10, 5)
-    stop_pct = st.slider("Stop-Loss: Kursbewegung (%)", 0.5, 3.0, 1.0, 0.5)
-    take_pct = st.slider("Take-Profit: Kursbewegung (%)", 1.0, 6.0, 2.0, 0.5)
-    st.caption("Gebührenannahme: 0,8 % pro Orderseite auf den Positionswert. Kein Funding, kein Spread/Slippage modelliert.")
-    if st.button("Simulation zurücksetzen"):
-        for k in ("cash", "position", "trades", "last_signal", "halted"):
-            del st.session_state[k]
-        st.rerun()
+def open_position(coin, side, price, amount, lev, fee, reason):
+    if st.session_state.position is not None:
+        return
+    notional = amount*lev
+    entry_fee = notional*fee/100
+    if amount+entry_fee > st.session_state.cash:
+        return
+    st.session_state.cash -= amount+entry_fee
+    st.session_state.position = dict(coin=coin,side=side,entry=price,margin=amount,notional=notional,entry_fee=entry_fee,opened=time.time(),reason=reason)
+    st.session_state.trades.insert(0,dict(time=datetime.now(timezone.utc).isoformat(timespec='seconds'),coin=coin,action='OPEN '+side,price=round(price,5),pnl=round(-entry_fee,4),reason=reason))
 
-@st.fragment(run_every="10s")
-def monitor():
-    today = datetime.now(timezone.utc).date().isoformat()
-    if st.session_state.day != today:
-        st.session_state.day = today
-        st.session_state.day_start = st.session_state.cash
-        st.session_state.halted = False
-    results = []
-    errors = []
-    for coin in PAIRS:
+def close_position(price, fee, reason):
+    p = st.session_state.position
+    if p is None:
+        return
+    move = (price/p['entry']-1)*(1 if p['side']=='LONG' else -1)
+    exit_fee = p['notional']*fee/100
+    pnl = p['notional']*move-p['entry_fee']-exit_fee
+    st.session_state.cash += p['margin'] + p['notional']*move-exit_fee
+    st.session_state.trades.insert(0,dict(time=datetime.now(timezone.utc).isoformat(timespec='seconds'),coin=p['coin'],action='CLOSE '+p['side'],price=round(price,5),pnl=round(pnl,4),reason=reason))
+    st.session_state.position = None
+
+@st.fragment(run_every='1s')
+def live():
+    st.session_state.checks += 1
+    st.session_state.last_check = datetime.now().strftime('%H:%M:%S')
+    prices = {}; signals = []; errors = []
+    for coin in ('BTC','SOL','ETH'):
         try:
-            results.append(get_market(coin))
+            price = ticker(coin+'USDT')
+            df = candles(coin+'USDT')
+            side, rsi, vol_ok, candle_id = signal(df)
+            prices[coin] = price
+            signals.append(dict(coin=coin,price=round(price,4),rsi=rsi,volume_ok=vol_ok,signal=side,candle_id=candle_id))
         except Exception as exc:
-            errors.append(f"{coin}: {exc}")
+            errors.append(f'{coin}: {type(exc).__name__}: {exc}')
     if errors:
-        st.warning("Marktdatenfehler – keine neuen Trades bei unvollständigen Daten: " + "; ".join(errors))
-    prices = {x["coin"]: x["price"] for x in results}
-    pos = st.session_state.position
-    if pos and pos["coin"] in prices:
-        price = prices[pos["coin"]]
-        direction = 1 if pos["side"] == "LONG" else -1
-        gross = direction * (price - pos["entry"]) / pos["entry"] * pos["notional"]
-        equity = st.session_state.cash + pos["margin"] + gross - pos["notional"] * FEE_RATE
+        st.warning('Marktdaten teilweise nicht verfügbar. Keine neuen Orders bei fehlenden Daten. ' + ' | '.join(errors))
+    current_equity = equity(prices)
+    st.metric('Geschätztes Guthaben (USDT, näherungsweise €)',f'{current_equity:.2f}',delta=f'{current_equity-100:+.2f}')
+    st.caption('Kurse sind USDT, nicht EUR. Währungsumrechnung fehlt. Werte nur für technischen Paper-Test.')
+    st.write(f'Automatik: {"AN" if enabled else "AUS"} · Prüfungen: {st.session_state.checks} · Letzte Prüfung: {st.session_state.last_check}')
+    if signals:
+        st.dataframe(pd.DataFrame(signals).drop(columns='candle_id'),hide_index=True,use_container_width=True)
+    p = st.session_state.position
+    if enabled and p and p['coin'] in prices:
+        current = prices[p['coin']]
+        signed_move = (current/p['entry']-1)*(1 if p['side']=='LONG' else -1)*100
+        if signed_move <= -stop_pct:
+            close_position(current,fee_pct,'Stop-Loss (polling; no guaranteed fill)')
+        elif signed_move >= take_pct:
+            close_position(current,fee_pct,'Take-Profit')
+        elif p['reason']=='TECH_TEST' and time.time()-p['opened']>=30:
+            close_position(current,fee_pct,'Testtrade nach 30 Sekunden geschlossen')
+    if enabled and equity(prices) <= st.session_state.day_start-2:
+        st.error('Tagesverlustlimit von 2 Einheiten erreicht: keine neuen Positionen.')
+    elif enabled and st.session_state.position is None:
+        if test_mode and not st.session_state.test_started and 'BTC' in prices:
+            open_position('BTC','LONG',prices['BTC'],min(1.0,margin),1,fee_pct,'TECH_TEST')
+            st.session_state.test_started = True
+        elif not test_mode:
+            for s in signals:
+                if s['signal']=='HOLD':
+                    continue
+                if st.session_state.last_signal_candle.get(s['coin']) == s['candle_id']:
+                    continue
+                open_position(s['coin'],s['signal'],prices[s['coin']],margin,leverage,fee_pct,'EMA/RSI/VOLUME')
+                st.session_state.last_signal_candle[s['coin']] = s['candle_id']
+                break
+    st.subheader('Offene Position')
+    if st.session_state.position:
+        st.json(st.session_state.position)
     else:
-        equity = st.session_state.cash + (pos["margin"] if pos else 0)
-    st.metric("Geschätztes Kontoguthaben (Equity)", f"{equity:.2f} €", f"{equity-START:+.2f} €")
-    st.write(f"Freies Guthaben: **{st.session_state.cash:.2f} €** · Automatik: **{'AN' if st.session_state.enabled else 'AUS'}**")
-    if results:
-        st.dataframe(pd.DataFrame(results)[["coin", "price", "rsi", "signal", "volume_ok"]], hide_index=True, use_container_width=True)
-    if pos and pos["coin"] in prices:
-        price = prices[pos["coin"]]
-        direction = 1 if pos["side"] == "LONG" else -1
-        movement = direction * (price / pos["entry"] - 1) * 100
-        gross = pos["notional"] * movement / 100
-        exit_fee = pos["notional"] * FEE_RATE
-        # Stop/TP auch ohne Automatik als simulierte Sicherheitslogik prüfen.
-        reason = "STOP" if movement <= -pos["stop"] else "TAKE" if movement >= pos["take"] else None
-        if reason:
-            st.session_state.cash += pos["margin"] + gross - exit_fee
-            st.session_state.trades.append({"Zeit UTC": datetime.now(timezone.utc).isoformat(timespec="seconds"), "Coin": pos["coin"], "Aktion": f"CLOSE {pos['side']} ({reason})", "PnL €": round(gross - pos["entry_fee"] - exit_fee, 3)})
-            st.session_state.position = None
-            st.info(f"Simulierte Position geschlossen: {reason}")
-        else:
-            st.info(f"Offen: {pos['side']} {pos['coin']} | Einstieg {pos['entry']:.2f} € | Bewegung {movement:+.2f}% | Brutto-PnL {gross:+.3f} €")
-    if st.session_state.cash <= st.session_state.day_start - 2:
-        st.session_state.halted = True
-    if st.session_state.halted:
-        st.error("Tagesverlustlimit erreicht: keine neuen Positionen.")
-    # Nur auf neuer abgeschlossener Kerze und nur mit vollständigen Marktdaten.
-    if st.session_state.enabled and not errors and not st.session_state.position and not st.session_state.halted:
-        for x in results:
-            if x["signal"] == "HOLD":
-                continue
-            key = (x["coin"], x["candle"])
-            if st.session_state.last_signal == key:
-                continue
-            notional = margin * leverage
-            # 0,5 € geplantes Kursrisiko pro Trade, exklusive Gebühren.
-            if notional * stop_pct / 100 > 0.50 or st.session_state.cash < margin + notional * FEE_RATE:
-                continue
-            entry_fee = notional * FEE_RATE
-            st.session_state.cash -= margin + entry_fee
-            st.session_state.position = {"coin": x["coin"], "side": x["signal"], "entry": x["price"], "margin": margin, "notional": notional, "entry_fee": entry_fee, "stop": stop_pct, "take": take_pct}
-            st.session_state.last_signal = key
-            st.session_state.trades.append({"Zeit UTC": datetime.now(timezone.utc).isoformat(timespec="seconds"), "Coin": x["coin"], "Aktion": f"OPEN {x['signal']} {leverage}x", "PnL €": -round(entry_fee, 3)})
-            st.success(f"Virtuelle {x['signal']}-Position eröffnet: {x['coin']}, {leverage}x")
-            break
-    st.subheader("Handelsprotokoll (nur aktuelle Sitzung)")
-    st.dataframe(pd.DataFrame(st.session_state.trades), hide_index=True, use_container_width=True)
-    st.caption("Alle 10 Sekunden nur bei aktiver Sitzung; iPhone-Sperre/Cloud-Sleep unterbrechen die Prüfung. Keine echte Liquidations-, Funding- oder Spread-Simulation. Nicht für Echtgeld geeignet.")
+        st.write('Keine')
+    st.subheader('Handelsprotokoll')
+    if st.session_state.trades:
+        st.dataframe(pd.DataFrame(st.session_state.trades),hide_index=True,use_container_width=True)
+    else:
+        st.write('Noch keine Trades')
+    st.caption('Keine persistente Speicherung. Keine Liquidations-, Funding- oder Slippage-Modellierung. Streamlit und API können das Intervall verzögern.')
 
-monitor()
+live()
