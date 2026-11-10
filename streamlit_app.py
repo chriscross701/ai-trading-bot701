@@ -4,14 +4,14 @@ import requests
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Trading Bot 6.1 | Paper Scanner", layout="wide")
-st.title("Trading Bot 6.1 – Top-100 Paper Scanner")
+st.set_page_config(page_title="Trading Bot 6.2 | Paper Scanner", layout="wide")
+st.title("Trading Bot 6.2 – Top-100 Paper Scanner")
 st.caption("Nur Simulation. Keine echten Orders, keine KI-API. USD-Konto. Keine Renditegarantie.")
 START = 100.0
 CG = "https://api.coingecko.com/api/v3/coins/markets"
 KRAKEN = "https://api.kraken.com/0/public"
 S = requests.Session()
-S.headers.update({"User-Agent": "PaperScanner/6.1 (educational)"})
+S.headers.update({"User-Agent": "PaperScanner/6.2 (educational)"})
 
 if "bot5" not in st.session_state:
     st.session_state.bot5 = dict(cash=START, positions={}, trades=[], checks=0, peak=START,
@@ -385,122 +385,207 @@ def backtest_signals(df):
     return d, atr, strategies
 
 def simulate_strategy(d, atr, long_cond, short_cond, start, end, fee, slip, minutes, capital=100.0):
-    """Next-bar open entry, pessimistic stop priority, next-open time exit."""
-    cash = capital
-    trades = []
-    pos = None
-    last_exit = -999
-    stop_k = 1.5
-    for i in range(max(start, 205), min(end, len(d)-1)):
-        bar = d.iloc[i]
-        nxt = d.iloc[i+1]
-        if pos:
-            side, entry, notional, margin, stop_dist, opened = pos
-            sign = 1 if side=="LONG" else -1
-            # Stops/targets use the next completed bar. If both touched, stop wins.
-            stop_price = entry*(1-sign*stop_dist)
-            target_price = entry*(1+sign*2*stop_dist)
-            hit_stop = bar["low"]<=stop_price if sign==1 else bar["high"]>=stop_price
-            hit_target = bar["high"]>=target_price if sign==1 else bar["low"]<=target_price
-            reason = None
+    """Bar-based paper backtest. Signals at close i, entry at next open i+1.
+    Stop/target checked from entry bar onwards; if both hit, stop wins.
+    Results for each split start flat, so split figures are NOT a single portfolio.
+    """
+    cash=float(capital)
+    trades=[]
+    pos=None
+    last_exit=-1000
+    equity_curve=[cash]
+    for i in range(max(start,205),min(end,len(d))):
+        bar=d.iloc[i]
+        if pos is not None:
+            side,entry,notional,dist,opened=pos
+            sign=1 if side=='LONG' else -1
+            stop=entry*(1-sign*dist)
+            target=entry*(1+sign*2*dist)
+            hit_stop=(bar['low']<=stop) if sign==1 else (bar['high']>=stop)
+            hit_target=(bar['high']>=target) if sign==1 else (bar['low']<=target)
+            raw=None; reason=None
             if hit_stop:
-                raw = min(bar["open"],stop_price) if sign==1 else max(bar["open"],stop_price)
-                reason="Stop"
+                raw=min(float(bar['open']),stop) if sign==1 else max(float(bar['open']),stop)
+                reason='Stop'
             elif hit_target:
-                raw=target_price
-                reason="Ziel"
+                raw=target
+                reason='Ziel'
             elif i-opened>=minutes:
-                raw=float(nxt["open"])
-                reason="Zeitlimit"
+                raw=float(bar['open'])
+                reason='Zeitlimit'
             if reason:
                 exit_px=raw*(1-sign*slip)
-                pnl=notional*sign*(exit_px/entry-1)-notional*fee*2
-                cash+=pnl
-                trades.append(dict(pnl=pnl, reason=reason, side=side))
+                gross=notional*sign*(exit_px/entry-1)
+                fees=notional*fee*2
+                net=gross-fees
+                cash+=net
+                trades.append(dict(pnl=net,gross=gross,fees=fees,
+                                   slippage_est=notional*slip*2,
+                                   reason=reason,side=side,opened=opened,closed=i))
                 pos=None
                 last_exit=i
                 if cash<=0:
                     break
-        if pos is None and i>last_exit+2 and i<end-1:
-            side = "LONG" if bool(long_cond.iloc[i]) else ("SHORT" if bool(short_cond.iloc[i]) else None)
-            if side and pd.notna(atr.iloc[i]) and atr.iloc[i]>0:
-                # Fixed 1% risk, 3x cap, 50% of capital margin max.
-                entry_raw=float(nxt["open"])
-                stop_dist=max(.003,min(.02,1.5*float(atr.iloc[i])/entry_raw))
-                notional=min(cash*.01/stop_dist, cash*3*.5)
+        # New orders only after this bar closes; next bar open is the fill.
+        if pos is None and i>last_exit+2 and i+1<end:
+            side='LONG' if bool(long_cond.iloc[i]) else ('SHORT' if bool(short_cond.iloc[i]) else None)
+            if side and pd.notna(atr.iloc[i]) and float(atr.iloc[i])>0:
+                next_open=float(d.iloc[i+1]['open'])
+                if next_open<=0: continue
+                dist=max(.003,min(.02,1.5*float(atr.iloc[i])/next_open))
+                notional=min(cash*.01/dist,cash*3*.5)
                 if notional<=0: continue
-                sign=1 if side=="LONG" else -1
-                entry=entry_raw*(1+sign*slip)
-                pos=(side,entry,notional,notional/3,stop_dist,i+1)
-    # Mark to market any still-open position at the final close, including exit costs.
+                sign=1 if side=='LONG' else -1
+                entry=next_open*(1+sign*slip)
+                pos=(side,entry,notional,dist,i+1)
+        if pos:
+            side,entry,notional,dist,opened=pos
+            sign=1 if side=='LONG' else -1
+            marked=cash+notional*sign*(float(bar['close'])/entry-1)-notional*fee*2
+        else:
+            marked=cash
+        equity_curve.append(marked)
     if pos and cash>0:
-        side, entry, notional, margin, stop_dist, opened=pos
-        sign=1 if side=="LONG" else -1
-        exit_px=float(d.iloc[min(end-1,len(d)-1)]["close"])*(1-sign*slip)
-        pnl=notional*sign*(exit_px/entry-1)-notional*fee*2
-        cash+=pnl
-        trades.append(dict(pnl=pnl, reason="Testende", side=side))
-    wins=sum(t["pnl"]>0 for t in trades)
-    gross_profit=sum(max(0,t["pnl"]) for t in trades)
-    gross_loss=-sum(min(0,t["pnl"]) for t in trades)
-    return dict(trades=len(trades), winrate=100*wins/len(trades) if trades else 0,
-                net=round(cash-capital,3), final=round(cash,3),
-                pf=round(gross_profit/gross_loss,2) if gross_loss>0 else (float("nan") if not trades else 99.0))
+        side,entry,notional,dist,opened=pos
+        sign=1 if side=='LONG' else -1
+        exit_px=float(d.iloc[min(end-1,len(d)-1)]['close'])*(1-sign*slip)
+        gross=notional*sign*(exit_px/entry-1)
+        fees=notional*fee*2
+        net=gross-fees
+        cash+=net
+        trades.append(dict(pnl=net,gross=gross,fees=fees,
+                           slippage_est=notional*slip*2,reason='Testende',
+                           side=side,opened=opened,closed=min(end-1,len(d)-1)))
+        equity_curve.append(cash)
+    peak=capital; maxdd=0.0
+    for x in equity_curve:
+        peak=max(peak,x)
+        if peak>0: maxdd=max(maxdd,100*(peak-x)/peak)
+    wins=sum(t['pnl']>0 for t in trades)
+    gp=sum(max(0,t['pnl']) for t in trades)
+    gl=-sum(min(0,t['pnl']) for t in trades)
+    return dict(trades=len(trades),winrate=100*wins/len(trades) if trades else 0,
+                net=cash-capital,gross=sum(t['gross'] for t in trades),
+                fees=sum(t['fees'] for t in trades),
+                slippage_est=sum(t['slippage_est'] for t in trades),
+                maxdd=maxdd,pf=gp/gl if gl>0 else None,
+                details=trades)
+
+def normalize_csv(upload):
+    import io
+    df=pd.read_csv(io.BytesIO(upload.getvalue()))
+    df.columns=[str(c).strip().lower() for c in df.columns]
+    aliases={'timestamp':'time','date':'time','datetime':'time','vol':'volume'}
+    df=df.rename(columns={k:v for k,v in aliases.items() if k in df.columns and v not in df.columns})
+    required={'time','open','high','low','close','volume'}
+    if not required.issubset(df.columns):
+        raise ValueError('CSV benötigt time,open,high,low,close,volume (oder timestamp/date statt time).')
+    df=df[list(required)].copy()
+    for k in ('open','high','low','close','volume'):
+        df[k]=pd.to_numeric(df[k],errors='coerce')
+    if pd.api.types.is_numeric_dtype(df['time']):
+        nums=pd.to_numeric(df['time'],errors='coerce')
+        unit='ms' if nums.dropna().median()>1e11 else 's'
+        dates=pd.to_datetime(nums,unit=unit,utc=True,errors='coerce')
+    else:
+        dates=pd.to_datetime(df['time'],utc=True,errors='coerce')
+    df['time']=(dates.astype('int64')//10**9).where(dates.notna())
+    df=df.dropna().sort_values('time').drop_duplicates('time').reset_index(drop=True)
+    if (df[['open','high','low','close']]<=0).any().any():
+        raise ValueError('OHLC-Kurse müssen positiv sein.')
+    if (df['volume']<0).any():
+        raise ValueError('Volumen darf nicht negativ sein.')
+    if ((df['high']<df[['open','close','low']].max(axis=1)) | (df['low']>df[['open','close','high']].min(axis=1))).any():
+        raise ValueError('Inkonsistente OHLC-Kerzen gefunden.')
+    if len(df)<350:
+        raise ValueError('Mindestens 350 Kerzen erforderlich.')
+    gaps=df['time'].diff().dropna()
+    if not gaps.empty and gaps.median()!=60:
+        raise ValueError('Bitte echte 1-Minuten-Kerzen verwenden (Medianabstand 60 Sekunden).')
+    if (gaps>120).sum()>max(5,len(gaps)*.01):
+        raise ValueError('Zu viele Lücken in den Kursdaten.')
+    return df
 
 def show_backtest():
-    st.header("Strategie-Backtest 6.1")
-    st.warning("Kraken stellt hier nur ca. 720 Minutenkerzen pro Coin bereit (maximal rund 12 Stunden). Das ist ein Kurztest, kein Nachweis einer profitablen Strategie.")
-    try:
-        available=kraken_pairs()
-    except Exception as exc:
-        st.error(f"Kraken-Märkte nicht verfügbar: {exc}")
+    st.header('Strategie-Backtest 6.2')
+    st.write('Vier Strategien, chronologische Trainings- und Testabschnitte, Kurs-PnL und Kosten getrennt.')
+    source=st.radio('Historische Daten', ['Kraken-Kurztest (~12 Stunden)','CSV hochladen (Wochen/Monate)'],horizontal=False)
+    datasets={}
+    if source.startswith('CSV'):
+        st.caption('CSV je Coin: time,open,high,low,close,volume. time als UTC-Datum, Unix-Sekunden oder Unix-Millisekunden. Ausschließlich 1-Minuten-Kerzen.')
+        uploads=st.file_uploader('Historische 1-Minuten-CSV-Dateien',type=['csv'],accept_multiple_files=True)
+        for u in uploads or []:
+            try:
+                df=normalize_csv(u)
+                # The indicator function removes a potentially forming last candle.
+                # Uploaded CSVs contain only complete bars: append a dummy bar,
+                # which is removed by backtest_signals.
+                dummy=df.iloc[[-1]].copy()
+                dummy['time']=dummy['time']+60
+                datasets[u.name.rsplit('.',1)[0]]=pd.concat([df,dummy],ignore_index=True)
+            except Exception as exc:
+                st.error(f'{u.name}: {exc}')
+    else:
+        st.warning('Kraken-OHLC liefert maximal etwa 720 Minutenkerzen. Für einen mehrwöchigen Test historische CSV-Daten hochladen.')
+        try:
+            available=kraken_pairs()
+            common={'BTC':'XBT','ETH':'ETH','SOL':'SOL','ADA':'ADA','XRP':'XRP','LINK':'LINK','AVAX':'AVAX','DOT':'DOT','LTC':'LTC','AAVE':'AAVE'}
+            choices={coin:available[base] for coin,base in common.items() if base in available}
+            selected=st.multiselect('Coins',list(choices),default=list(choices)[:3],max_selections=6)
+        except Exception as exc:
+            st.error(f'Kraken nicht verfügbar: {exc}')
+            return
+    hold=st.slider('Maximale Haltedauer im Backtest (Minuten)',3,30,10)
+    test_fraction=st.slider('Unberührter Testanteil (%)',20,50,30,5)
+    fee=st.number_input('Gebühren je Seite (%) – Backtest',0.0,1.0,0.10,0.01)/100
+    slip=st.number_input('Slippage je Seite (%) – Backtest',0.0,1.0,0.05,0.01)/100
+    st.caption('Feste Regeln: 3× Hebelobergrenze, 1 % Kursrisiko, Stop 1,5 ATR, Ziel 2R. Signal am Kerzenschluss, Fill nächste Kerzeneröffnung. Keine Strategieoptimierung auf Testdaten.')
+    if not st.button('Backtest ausführen',type='primary'):
         return
-    common={"BTC":"XBT","ETH":"ETH","SOL":"SOL","ADA":"ADA","XRP":"XRP","LINK":"LINK","AVAX":"AVAX","DOT":"DOT","LTC":"LTC","AAVE":"AAVE"}
-    choices={coin:available[base] for coin,base in common.items() if base in available}
-    selected=st.multiselect("Coins für historischen Vergleich",list(choices),default=list(choices)[:3],max_selections=6)
-    hold=st.slider("Maximale Haltedauer (Minuten)",3,30,10)
-    test_fraction=st.slider("Unberührter Testanteil (%)",20,50,30,5)
-    st.caption("Annahmen: 3× maximaler Hebel, 1 % Kursrisiko je Position, 0,1 % Gebühren und 0,05 % Slippage pro Seite; Stop-Loss 1,5 ATR, Ziel 2R. Signale nach Kerzenschluss, Einstieg zur nächsten Kerzeneröffnung.")
-    if not st.button("Vier Strategien historisch vergleichen",type="primary"):
-        return
-    if not selected:
-        st.info("Bitte mindestens einen Coin auswählen.")
+    if source.startswith('Kraken'):
+        for coin in selected:
+            try: datasets[coin]=ohlc(choices[coin])
+            except Exception as exc: st.warning(f'{coin}: {exc}')
+    if not datasets:
+        st.error('Keine auswertbaren Kursdaten ausgewählt.')
         return
     results=[]
-    failures=[]
-    with st.spinner("Lade historische Daten und berechne Strategien ..."):
-        for coin in selected:
-            try:
-                data=ohlc(choices[coin])
-                d,atr,strategies=backtest_signals(data)
-                cut=int(len(d)*(1-test_fraction/100))
-                if cut<220 or len(d)-cut<50:
-                    failures.append(f"{coin}: Zu wenige Kerzen ({len(d)})")
-                    continue
-                for name,(longs,shorts) in strategies.items():
-                    train=simulate_strategy(d,atr,longs,shorts,205,cut,.001,.0005,hold)
-                    test=simulate_strategy(d,atr,longs,shorts,cut,len(d),.001,.0005,hold)
-                    results.append(dict(Coin=coin,Strategie=name,
-                        Training_USD=train["net"],Test_USD=test["net"],
-                        Test_Trades=test["trades"],Test_Trefferquote=f'{test["winrate"]:.0f}%',
-                        Test_Profitfaktor=test["pf"]))
-            except Exception as exc:
-                failures.append(f"{coin}: {type(exc).__name__}: {str(exc)[:110]}")
-    if failures:
-        st.warning(" | ".join(failures))
+    for coin,data in datasets.items():
+        try:
+            d,atr,strategies=backtest_signals(data)
+            cut=int(len(d)*(1-test_fraction/100))
+            if cut<250 or len(d)-cut<60:
+                st.warning(f'{coin}: Zu wenige Kerzen für getrennte Phasen ({len(d)}).')
+                continue
+            for name,(longs,shorts) in strategies.items():
+                train=simulate_strategy(d,atr,longs,shorts,205,cut,fee,slip,hold)
+                test=simulate_strategy(d,atr,longs,shorts,cut,len(d),fee,slip,hold)
+                results.append(dict(Coin=coin,Strategie=name,Train_Netto=round(train['net'],2),
+                    Test_Netto=round(test['net'],2),Test_KursPnL=round(test['gross']+test['slippage_est'],2),
+                    Test_Gebuehren=round(test['fees'],2),Test_Slippage_ca=round(test['slippage_est'],2),
+                    Test_Trades=test['trades'],Trefferquote_pct=round(test['winrate'],1),
+                    Max_Drawdown_pct=round(test['maxdd'],1),
+                    Profitfaktor=round(test['pf'],2) if test['pf'] is not None else None))
+        except Exception as exc:
+            st.warning(f'{coin}: {type(exc).__name__}: {exc}')
     if not results:
-        st.error("Keine auswertbaren Ergebnisse. Bitte andere Coins oder später erneut versuchen.")
+        st.error('Keine Ergebnisse. CSV-Format und Datenmenge prüfen.')
         return
     table=pd.DataFrame(results)
-    st.subheader("Ergebnisse auf getrennten Zeitabschnitten")
-    st.table(table.sort_values("Test_USD",ascending=False))
-    grouped=table.groupby("Strategie",as_index=False).agg(
-        Test_USD=("Test_USD","sum"),Test_Trades=("Test_Trades","sum"),
-        Positive_Coins=("Test_USD",lambda x:int((x>0).sum())))
-    st.subheader("Zusammenfassung der vier Strategien")
-    st.table(grouped.sort_values("Test_USD",ascending=False))
-    st.info("Die Ergebnisse sind ein explorativer Vergleich. Bei nur wenigen Trades oder wenigen Stunden Daten sind sie stark zufallsabhängig. Kein automatisches Umschalten auf die scheinbar beste Strategie: Das würde die Testdaten nachträglich zur Optimierung verwenden.")
-    st.caption("Einschränkungen: vereinfachte Ausführung, kein Orderbuch-Spread, keine Funding-/Liquidationskosten, keine Portfolio-Korrelation. Gleichzeitiger Stop und Ziel wird pessimistisch als Stop gewertet. Keine echte 30-Sekunden-Strategie.")
+    st.subheader('Ergebnisse je Coin – getrennte Zeitabschnitte')
+    st.table(table.sort_values('Test_Netto',ascending=False))
+    st.subheader('Strategievergleich (Summen unabhängiger Coin-Tests)')
+    summary=table.groupby('Strategie',as_index=False).agg(Test_Netto=('Test_Netto','sum'),
+        KursPnL=('Test_KursPnL','sum'),Gebuehren=('Test_Gebuehren','sum'),
+        Slippage=('Test_Slippage_ca','sum'),Trades=('Test_Trades','sum'),
+        Positive_Coins=('Test_Netto',lambda x:int((x>0).sum())))
+    st.table(summary.sort_values('Test_Netto',ascending=False))
+    if (summary['Test_Netto']<=0).all():
+        st.error('Keine der vier Strategien war im Test nach Kosten profitabel. Keine Freigabe für automatisches Echtgeld-Trading.')
+    else:
+        st.info('Positive Kurztestergebnisse sind kein Beweis für zukünftige Profitabilität. Auf neuen Zeiträumen erneut prüfen.')
+    st.download_button('Ergebnisse als CSV',data=table.to_csv(index=False).encode(),file_name='backtest_6_2.csv',mime='text/csv')
+    st.caption('Grenzen: keine Portfolio-Simulation, keine echten Orderbuch-Spreads, Funding- oder Liquidationskosten. Slippage ist eine Annahme. Gewinne einzelner Coins dürfen nicht als reale Kontorendite interpretiert werden.')
 
 if page == "Paper-Trading":
     live()
