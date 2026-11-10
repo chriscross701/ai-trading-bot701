@@ -4,183 +4,193 @@ import requests
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title='AI Trading Bot 3.1', layout='wide')
-st.title('AI Trading Bot 3.1 – Paper Scalping')
-st.caption('Simulation only. No exchange orders, no API keys. Refresh target: 1 second while session is active.')
+st.set_page_config(page_title='Paper Scalping Bot 4.0', layout='wide')
+st.title('Paper Scalping Bot 4.0')
+st.caption('Simulation only · Kraken USD market data · no real orders · 1-second target, not guaranteed')
 
-if 'cash' not in st.session_state:
-    st.session_state.cash = 100.0
-    st.session_state.position = None
-    st.session_state.trades = []
-    st.session_state.checks = 0
-    st.session_state.last_check = None
-    st.session_state.test_started = False
-    st.session_state.test_completed = False
-    st.session_state.last_signal_candle = {}
-    st.session_state.day_start = 100.0
+COINS = {'BTC': 'XBTUSD', 'SOL': 'SOLUSD', 'ETH': 'ETHUSD'}
+START_BALANCE = 100.0
+
+if 'account' not in st.session_state:
+    st.session_state.account = dict(cash=START_BALANCE, positions={}, trades=[], checks=0, day_start=START_BALANCE, day=datetime.now(timezone.utc).date().isoformat(), last_entry={}, last_closed={}, last_check=None)
+a = st.session_state.account
 
 with st.sidebar:
-    st.header('Einstellungen')
+    st.header('Paper-Einstellungen')
     enabled = st.toggle('Automatische Paper-Trades', value=False)
-    leverage = st.slider('Hebel (Simulation)', 1, 5, 2)
-    margin = st.slider('Margin pro Position (€)', 1.0, 10.0, 5.0)
-    stop_pct = st.slider('Stop-Loss: Kursbewegung (%)', 0.2, 3.0, 1.0, 0.1)
-    take_pct = st.slider('Take-Profit: Kursbewegung (%)', 0.2, 5.0, 2.0, 0.1)
-    fee_pct = st.number_input('Gebühr pro Orderseite (%)', 0.0, 2.0, 0.1, 0.01)
-    test_mode = st.toggle('Einmaligen Testtrade ausführen', value=False, help='Öffnet eine kleine virtuelle BTC-Long-Position und schließt sie nach 30 Sekunden. Nur bei eingeschalteter Automatik.')
+    leverage = st.slider('Hebel', 1, 5, 2)
+    margin = st.slider('Margin je Position (USD)', 1.0, 10.0, 5.0)
+    stop_pct = st.slider('Stop-Loss: Kursbewegung (%)', 0.2, 3.0, 0.7, 0.1)
+    take_pct = st.slider('Take-Profit: Kursbewegung (%)', 0.2, 5.0, 1.2, 0.1)
+    fee_pct = st.number_input('Gebühr pro Seite (%)', min_value=0.0, max_value=2.0, value=0.10, step=0.01)
+    spread_pct = st.number_input('Simulierter Spread gesamt (%)', min_value=0.0, max_value=2.0, value=0.05, step=0.01)
+    slippage_pct = st.number_input('Slippage pro Seite (%)', min_value=0.0, max_value=2.0, value=0.03, step=0.01)
+    max_loss = st.slider('Maximaler Tagesverlust (USD)', 1.0, 20.0, 3.0)
+    cooldown = st.slider('Pause nach Positionsschluss (Sek.)', 0, 300, 30)
     if st.button('Simulation zurücksetzen'):
-        for k in ('cash','position','trades','checks','last_check','test_started','test_completed','last_signal_candle','day_start'):
-            st.session_state.pop(k, None)
+        st.session_state.pop('account', None)
         st.rerun()
 
-KRAKEN_PAIRS = {
-    "BTCUSDT": "XBTUSD",
-    "SOLUSDT": "SOLUSD",
-    "ETHUSDT": "ETHUSD"
-}
-
 @st.cache_data(ttl=1, show_spinner=False)
-def ticker(symbol):
-    pair = KRAKEN_PAIRS[symbol]
-    response = requests.get(
-        "https://api.kraken.com/0/public/Ticker",
-        params={"pair": pair},
-        timeout=5
-    )
-    response.raise_for_status()
-    data = response.json()
-    if data.get("error"):
-        raise ValueError(str(data["error"]))
-    result = next(iter(data["result"].values()))
-    return float(result["c"][0])
-
+def ticker(pair):
+    r = requests.get('https://api.kraken.com/0/public/Ticker', params={'pair': pair}, timeout=5)
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get('error'):
+        raise ValueError(str(payload['error']))
+    return float(next(iter(payload['result'].values()))['c'][0])
 
 @st.cache_data(ttl=15, show_spinner=False)
-def candles(symbol):
-    pair = KRAKEN_PAIRS[symbol]
-    response = requests.get(
-        "https://api.kraken.com/0/public/OHLC",
-        params={"pair": pair, "interval": 1},
-        timeout=5
-    )
-    response.raise_for_status()
-    data = response.json()
-    if data.get("error"):
-        raise ValueError(str(data["error"]))
-
-    key = next(k for k in data["result"] if k != "last")
-    rows = data["result"][key][-80:]
-
+def candles(pair):
+    r = requests.get('https://api.kraken.com/0/public/OHLC', params={'pair': pair, 'interval': 1}, timeout=5)
+    r.raise_for_status()
+    payload = r.json()
+    if payload.get('error'):
+        raise ValueError(str(payload['error']))
+    key = next(k for k in payload['result'] if k != 'last')
+    rows = payload['result'][key][-100:]
     df = pd.DataFrame(rows)
-    df["close"] = pd.to_numeric(df[4])
-    df["volume"] = pd.to_numeric(df[6])
+    df['close'] = pd.to_numeric(df[4])
+    df['volume'] = pd.to_numeric(df[6])
+    df['timestamp'] = pd.to_numeric(df[0])
     return df
 
-def signal(df):
-    # Only completed candles: never act on the still-forming candle.
-    d = df.iloc[:-1].copy()
-    close = d['close']; vol = d['volume']
+def get_signal(df):
+    d = df.iloc[:-1].copy()  # Do not use an unfinished 1-minute candle.
+    if len(d) < 35:
+        return 'HOLD', None, False, None
+    close, volume = d['close'], d['volume']
     fast = close.ewm(span=9, adjust=False).mean()
     slow = close.ewm(span=21, adjust=False).mean()
     delta = close.diff()
     up = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     down = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    rsi = 100 - 100/(1 + up/(down + 1e-12))
-    volume_ok = bool(vol.iloc[-1] > vol.iloc[-21:-1].mean())
+    rsi = float((100 - 100 / (1 + up / (down + 1e-12))).iloc[-1])
+    volume_ok = bool(volume.iloc[-1] > volume.iloc[-21:-1].mean())
     direction = 'HOLD'
-    if volume_ok and fast.iloc[-1] > slow.iloc[-1] and 52 < rsi.iloc[-1] < 72:
+    if volume_ok and fast.iloc[-1] > slow.iloc[-1] and 52 < rsi < 72:
         direction = 'LONG'
-    elif volume_ok and fast.iloc[-1] < slow.iloc[-1] and 28 < rsi.iloc[-1] < 48:
+    elif volume_ok and fast.iloc[-1] < slow.iloc[-1] and 28 < rsi < 48:
         direction = 'SHORT'
-    return direction, round(float(rsi.iloc[-1]),1), volume_ok, int(d.iloc[-1,0])
+    return direction, round(rsi, 1), volume_ok, int(d['timestamp'].iloc[-1])
 
-def equity(prices):
-    p = st.session_state.position
-    if not p:
-        return st.session_state.cash
-    current = prices.get(p['coin'],p['entry'])
-    change = (current/p['entry']-1) * (1 if p['side']=='LONG' else -1)
-    return st.session_state.cash + p['margin'] + p['notional']*change
+def fill_price(price, side, opening):
+    # Long buy/short cover costs more; short sell/long exit receives less.
+    buy = (side == 'LONG') == opening
+    adjustment = (spread_pct / 2 + slippage_pct) / 100
+    return price * (1 + adjustment if buy else 1 - adjustment)
 
-def open_position(coin, side, price, amount, lev, fee, reason):
-    if st.session_state.position is not None:
-        return
-    notional = amount*lev
-    entry_fee = notional*fee/100
-    if amount+entry_fee > st.session_state.cash:
-        return
-    st.session_state.cash -= amount+entry_fee
-    st.session_state.position = dict(coin=coin,side=side,entry=price,margin=amount,notional=notional,entry_fee=entry_fee,opened=time.time(),reason=reason)
-    st.session_state.trades.insert(0,dict(time=datetime.now(timezone.utc).isoformat(timespec='seconds'),coin=coin,action='OPEN '+side,price=round(price,5),pnl=round(-entry_fee,4),reason=reason))
+def unrealized(p, price):
+    move = (price / p['entry'] - 1) * (1 if p['side'] == 'LONG' else -1)
+    return p['notional'] * move
 
-def close_position(price, fee, reason):
-    p = st.session_state.position
-    if p is None:
+def account_equity(prices):
+    total = a['cash']
+    for coin, p in a['positions'].items():
+        total += p['margin'] + unrealized(p, prices.get(coin, p['entry']))
+    return total
+
+def close_position(coin, price, reason):
+    p = a['positions'].pop(coin)
+    execution = fill_price(price, p['side'], False)
+    gross = unrealized(p, execution)
+    exit_fee = p['notional'] * fee_pct / 100
+    net = gross - p['entry_fee'] - exit_fee
+    a['cash'] += max(0.0, p['margin'] + gross - exit_fee)
+    a['last_closed'][coin] = time.time()
+    a['trades'].insert(0, dict(time=datetime.now(timezone.utc).isoformat(timespec='seconds'), coin=coin, side=p['side'], entry=round(p['entry'], 5), exit=round(execution, 5), net_pnl=round(net, 4), reason=reason))
+
+def open_position(coin, side, price, candle_id):
+    if coin in a['positions'] or len(a['positions']) >= 3:
         return
-    move = (price/p['entry']-1)*(1 if p['side']=='LONG' else -1)
-    exit_fee = p['notional']*fee/100
-    pnl = p['notional']*move-p['entry_fee']-exit_fee
-    st.session_state.cash += p['margin'] + p['notional']*move-exit_fee
-    st.session_state.trades.insert(0,dict(time=datetime.now(timezone.utc).isoformat(timespec='seconds'),coin=p['coin'],action='CLOSE '+p['side'],price=round(price,5),pnl=round(pnl,4),reason=reason))
-    st.session_state.position = None
+    notional = margin * leverage
+    entry_fee = notional * fee_pct / 100
+    if a['cash'] < margin + entry_fee:
+        return
+    entry = fill_price(price, side, True)
+    a['cash'] -= margin + entry_fee
+    a['positions'][coin] = dict(coin=coin, side=side, entry=entry, margin=margin, notional=notional, entry_fee=entry_fee, opened=time.time())
+    a['last_entry'][coin] = candle_id
 
 @st.fragment(run_every='1s')
 def live():
-    st.session_state.checks += 1
-    st.session_state.last_check = datetime.now().strftime('%H:%M:%S')
-    prices = {}; signals = []; errors = []
-    for coin in ('BTC','SOL','ETH'):
+    a['checks'] += 1
+    a['last_check'] = datetime.now(timezone.utc).strftime('%H:%M:%S UTC')
+    prices, signals, errors = {}, [], []
+    for coin, pair in COINS.items():
         try:
-            price = ticker(coin+'USDT')
-            df = candles(coin+'USDT')
-            side, rsi, vol_ok, candle_id = signal(df)
+            price = ticker(pair)
+            direction, rsi, vol_ok, candle_id = get_signal(candles(pair))
             prices[coin] = price
-            signals.append(dict(coin=coin,price=round(price,4),rsi=rsi,volume_ok=vol_ok,signal=side,candle_id=candle_id))
+            signals.append(dict(coin=coin, price=round(price, 4), rsi=rsi, volume_ok=vol_ok, signal=direction, candle_id=candle_id))
         except Exception as exc:
             errors.append(f'{coin}: {type(exc).__name__}: {exc}')
-    if errors:
-        st.warning('Marktdaten teilweise nicht verfügbar. Keine neuen Orders bei fehlenden Daten. ' + ' | '.join(errors))
-    current_equity = equity(prices)
-    st.metric('Geschätztes Guthaben (USDT, näherungsweise €)',f'{current_equity:.2f}',delta=f'{current_equity-100:+.2f}')
-    st.caption('Kurse sind USDT, nicht EUR. Währungsumrechnung fehlt. Werte nur für technischen Paper-Test.')
-    st.write(f'Automatik: {"AN" if enabled else "AUS"} · Prüfungen: {st.session_state.checks} · Letzte Prüfung: {st.session_state.last_check}')
-    if signals:
-        st.dataframe(pd.DataFrame(signals).drop(columns='candle_id'),hide_index=True,use_container_width=True)
-    p = st.session_state.position
-    if enabled and p and p['coin'] in prices:
-        current = prices[p['coin']]
-        signed_move = (current/p['entry']-1)*(1 if p['side']=='LONG' else -1)*100
+
+    today = datetime.now(timezone.utc).date().isoformat()
+    if a['day'] != today:
+        a['day'], a['day_start'] = today, account_equity(prices)
+
+    # Manage existing exposure even when automation is switched off.
+    for coin, p in list(a['positions'].items()):
+        if coin not in prices:
+            continue
+        current = prices[coin]
+        signed_move = (current / p['entry'] - 1) * (1 if p['side'] == 'LONG' else -1) * 100
+        opposite = next((s for s in signals if s['coin'] == coin), None)
         if signed_move <= -stop_pct:
-            close_position(current,fee_pct,'Stop-Loss (polling; no guaranteed fill)')
+            close_position(coin, current, 'STOP (polling)')
         elif signed_move >= take_pct:
-            close_position(current,fee_pct,'Take-Profit')
-        elif p['reason']=='TECH_TEST' and time.time()-p['opened']>=30:
-            close_position(current,fee_pct,'Testtrade nach 30 Sekunden geschlossen')
-    if enabled and equity(prices) <= st.session_state.day_start-2:
-        st.error('Tagesverlustlimit von 2 Einheiten erreicht: keine neuen Positionen.')
-    elif enabled and st.session_state.position is None:
-        if test_mode and not st.session_state.test_started and 'BTC' in prices:
-            open_position('BTC','LONG',prices['BTC'],min(1.0,margin),1,fee_pct,'TECH_TEST')
-            st.session_state.test_started = True
-        elif not test_mode:
-            for s in signals:
-                if s['signal']=='HOLD':
-                    continue
-                if st.session_state.last_signal_candle.get(s['coin']) == s['candle_id']:
-                    continue
-                open_position(s['coin'],s['signal'],prices[s['coin']],margin,leverage,fee_pct,'EMA/RSI/VOLUME')
-                st.session_state.last_signal_candle[s['coin']] = s['candle_id']
-                break
-    st.subheader('Offene Position')
-    if st.session_state.position:
-        st.json(st.session_state.position)
+            close_position(coin, current, 'TAKE PROFIT')
+        elif opposite and opposite['signal'] not in ('HOLD', p['side']):
+            close_position(coin, current, 'OPPOSITE SIGNAL')
+        elif signed_move <= -100 / leverage:
+            close_position(coin, current, 'SIMULATED MARGIN EXHAUSTION')
+
+    eq = account_equity(prices)
+    halted = eq <= a['day_start'] - max_loss
+    if halted:
+        for coin in list(a['positions']):
+            if coin in prices:
+                close_position(coin, prices[coin], 'DAILY LOSS LIMIT')
+        eq = account_equity(prices)
+
+    if enabled and not halted and not errors:
+        for s in signals:
+            coin = s['coin']
+            if s['signal'] == 'HOLD' or coin in a['positions'] or s['candle_id'] is None:
+                continue
+            if a['last_entry'].get(coin) == s['candle_id']:
+                continue
+            if time.time() - a['last_closed'].get(coin, 0) < cooldown:
+                continue
+            open_position(coin, s['signal'], prices[coin], s['candle_id'])
+
+    eq = account_equity(prices)
+    st.metric('Geschätzte Equity (USD)', f'{eq:.2f}', delta=f'{eq-START_BALANCE:+.2f}')
+    st.write(f'Automatik: {"AN" if enabled else "AUS"} · Prüfungen: {a["checks"]} · Letzte Prüfung: {a["last_check"]}')
+    st.caption('USD, keine EUR-Umrechnung. 1-Minuten-Kerzen erzeugen keine neuen abgeschlossenen Signale jede Sekunde.')
+    if errors:
+        st.warning('Marktdatenfehler: ' + ' | '.join(errors))
+    if halted:
+        st.error('Tagesverlustlimit erreicht. Keine neuen Positionen bis zum nächsten UTC-Tag.')
+    if signals:
+        st.dataframe(pd.DataFrame(signals).drop(columns='candle_id'), hide_index=True, use_container_width=True)
+    st.subheader('Offene Positionen')
+    if a['positions']:
+        st.dataframe(pd.DataFrame(list(a['positions'].values())), hide_index=True, use_container_width=True)
     else:
-        st.write('Keine')
+        st.write('Keine offenen Positionen')
     st.subheader('Handelsprotokoll')
-    if st.session_state.trades:
-        st.dataframe(pd.DataFrame(st.session_state.trades),hide_index=True,use_container_width=True)
+    if a['trades']:
+        trades = pd.DataFrame(a['trades'])
+        st.dataframe(trades, hide_index=True, use_container_width=True)
+        closed = trades['net_pnl']
+        c1, c2, c3 = st.columns(3)
+        c1.metric('Geschlossene Trades', len(closed))
+        c2.metric('Gewinnquote', f'{(closed.gt(0).mean()*100):.1f}%')
+        c3.metric('Realisierter PnL (USD)', f'{closed.sum():+.2f}')
     else:
-        st.write('Noch keine Trades')
-    st.caption('Keine persistente Speicherung. Keine Liquidations-, Funding- oder Slippage-Modellierung. Streamlit und API können das Intervall verzögern.')
+        st.write('Noch keine geschlossenen Trades')
+    st.caption('Technischer Paper-Test: keine garantierte 1-s-Frequenz, kein echter WebSocket-Tickfeed, keine echten Börsenfills. Daten und Positionen sind nur sitzungsgebunden.')
 
 live()
