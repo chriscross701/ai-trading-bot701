@@ -33,19 +33,47 @@ with st.sidebar:
             st.session_state.pop(k, None)
         st.rerun()
 
+KRAKEN_PAIRS = {
+    "BTCUSDT": "XBTUSD",
+    "SOLUSDT": "SOLUSD",
+    "ETHUSDT": "ETHUSD"
+}
+
 @st.cache_data(ttl=1, show_spinner=False)
 def ticker(symbol):
-    response = requests.get('https://api.binance.com/api/v3/ticker/price', params={'symbol':symbol}, timeout=5)
+    pair = KRAKEN_PAIRS[symbol]
+    response = requests.get(
+        "https://api.kraken.com/0/public/Ticker",
+        params={"pair": pair},
+        timeout=5
+    )
     response.raise_for_status()
-    return float(response.json()['price'])
+    data = response.json()
+    if data.get("error"):
+        raise ValueError(str(data["error"]))
+    result = next(iter(data["result"].values()))
+    return float(result["c"][0])
+
 
 @st.cache_data(ttl=15, show_spinner=False)
 def candles(symbol):
-    response = requests.get('https://api.binance.com/api/v3/klines', params={'symbol':symbol,'interval':'1m','limit':80}, timeout=5)
+    pair = KRAKEN_PAIRS[symbol]
+    response = requests.get(
+        "https://api.kraken.com/0/public/OHLC",
+        params={"pair": pair, "interval": 1},
+        timeout=5
+    )
     response.raise_for_status()
-    rows = response.json()
+    data = response.json()
+    if data.get("error"):
+        raise ValueError(str(data["error"]))
+
+    key = next(k for k in data["result"] if k != "last")
+    rows = data["result"][key][-80:]
+
     df = pd.DataFrame(rows)
-    df['close'] = pd.to_numeric(df[4]); df['volume'] = pd.to_numeric(df[5])
+    df["close"] = pd.to_numeric(df[4])
+    df["volume"] = pd.to_numeric(df[6])
     return df
 
 def signal(df):
