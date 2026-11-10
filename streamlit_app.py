@@ -161,7 +161,7 @@ def live():
         st.error('Drawdown-Grenze erreicht. Neue Einstiege gesperrt; bestehende Positionen werden bei eingeschalteter Automatik weiter überwacht.')
     if elapsed >= 7:
         st.info('Die sieben Tage sind abgelaufen. Die Simulation läuft weiter, solange sie geöffnet ist.')
-    st.table(pd.DataFrame(rows)
+    st.table(pd.DataFrame(rows))
     st.subheader('Offene Positionen')
     st.table(pd.DataFrame([dict(coin=c, **p) for c,p in b['positions'].items()]), hide_index=True, use_container_width=True)
     st.subheader('Handelsprotokoll')
